@@ -1,0 +1,28 @@
+[package]
+name = "m0_audio_player"
+version = "0.1.0"
+edition = "2021"
+authors = ["Erik Tollerud <erik.tollerud@gmail.com>"]
+
+# for cargo flash
+[package.metadata]
+chip = "ATSAMD21G18A"
+
+[dependencies]
+panic-persist = "0.3"
+feather_m0 = "0.14"
+cortex-m = "0.7"
+
+[features]
+default = ["feather_m0/rt", "feather_m0/sdmmc", "feather_m0/adalogger"]
+
+[profile.dev]
+incremental = false
+codegen-units = 1
+debug = true
+lto = false
+
+[profile.release]
+debug = true
+lto = true
+opt-level = "s"
