@@ -12,6 +12,7 @@ chip = "ATSAMD21G18A"
 panic-persist = "0.3"
 feather_m0 = "0.14"
 cortex-m = "0.7"
+embedded-sdmmc = "0.3"
 
 [features]
 default = ["feather_m0/rt", "feather_m0/sdmmc", "feather_m0/adalogger"]
