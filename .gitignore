@@ -1,3 +1,4 @@
 **/target
 *.wav
 *.aup3
+**/Cargo.lock
