@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 
-//use core::fmt::Debug;
-
+use nb;
 use cortex_m::asm;
 
 use embedded_sdmmc;
+use embedded_sdmmc::{VolumeIdx, VolumeManager, SdCard};
+use embedded_hal_bus::spi::ExclusiveDevice;
 use panic_persist;
 
 use bsp::hal;
@@ -13,22 +14,22 @@ use bsp::pac;
 use feather_m0::{self as bsp, ehal::digital::StatefulOutputPin, hal::{embedded_io::Write, gpio::{Output, PushPull}}};
 
 use bsp::{entry, periph_alias, pin_alias};
-use hal::clock::{ClockGenId, ClockSource, GenericClockController};
 use hal::delay::Delay;
 use hal::prelude::*;
 use pac::{CorePeripherals, Peripherals};
 
-//use hal::embedded_io::*;
+use numtoa::NumToA;
 
 const VOL_IDX: usize = 0;
-const N_SONGS: usize = 1;
+const N_SONGS: usize = 6;
+const SD_CARD_KHZ: u32 = 4000;
 
 #[entry]
 fn main() -> ! {
 
     let mut peripherals = Peripherals::take().unwrap();
     let core = CorePeripherals::take().unwrap();
-    let mut clocks = GenericClockController::with_external_32kosc(
+    let mut clocks = hal::clock::GenericClockController::with_external_32kosc(
         peripherals.GCLK,
         &mut peripherals.PM,
         &mut peripherals.SYSCTRL,
@@ -90,14 +91,9 @@ fn main() -> ! {
         uart.write_all("SD card present, continuing with startup.\r\n".as_bytes()).expect("Could not write to uart!!");
     }
 
-    // we need the internal 32k running at 1024 Hz for the RTC which is needed by the sd controller
-    let timer_clock = clocks.configure_gclk_divider_and_source(ClockGenId::GCLK3, 32, ClockSource::XOSC32K, true).unwrap();
-    let rtc_clock = clocks.rtc(&timer_clock).unwrap();
-    let timer = hal::rtc::Rtc::clock_mode(peripherals.RTC, rtc_clock.freq(), &mut pm);
-
     // now set up SPI in low-speed mode
     let spi_sercom = periph_alias!(peripherals.spi_sercom);
-    let spi = bsp::spi_master(
+    let mut sd_spi = bsp::spi_master(
         &mut clocks,
         400_u32.kHz(),
         spi_sercom,
@@ -107,60 +103,46 @@ fn main() -> ! {
         pins.miso,
     );
     let mut sd_cs: bsp::SdCs = pins.sd_cs.into();
+    // do the weird SD init thing where you have to send >74 clocks with CS high/de-asserted
     sd_cs.set_high().unwrap();
+    for _ in 0..10 { nb::block!(sd_spi.send(0xAA)).unwrap(); } // 10*8 bits > 74 clocks
 
+    //speed up the SPI
+    sd_spi.reconfigure(|c| c.set_baud(SD_CARD_KHZ.kHz()));
 
-    let mut sdcontroller = embedded_sdmmc::Controller::new(embedded_sdmmc::SdMmcSpi::new(spi, sd_cs), timer);
-    match sdcontroller.device().init() {
-        Ok(_) => {
-            // start up the sd card
+    // now start up the SD controller
+    let sdmmc_spi = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).expect("Failed to create SpiDevice");
+    let card = SdCard::new(sdmmc_spi, delay);
+    let mut volume_mgr: VolumeManager<_, _, 1, N_SONGS, 1> = VolumeManager::new_with_limits(card, FakeClock {}, 0);
+    let mut sdvolume = volume_mgr
+        .open_volume(VolumeIdx(VOL_IDX))
+        .expect("Failed to open volume");
 
-            // first speed it up to a reasonable speed
-            sdcontroller
-                .device()
-                .spi()
-                .reconfigure(|c| c.set_baud(4.MHz()));
-
-            // now dump some info
-
-            let sdsize = sdcontroller.device().card_size_bytes().unwrap();
-            uart.write_fmt(format_args!("Sd card size is {sdsize}\r\n")).expect("Could not write to uart!!");
-
-            let mut sdvol =  match sdcontroller.get_volume(embedded_sdmmc::VolumeIdx(VOL_IDX)) {
-                Ok(v) => v,
-                Err(_) => panic!("could not get sd volume")
-            };
-            let root_dir = sdcontroller.open_root_dir(&sdvol).unwrap();
-
-            uart.write_all("starting read of first file\r\n".as_bytes()).expect("Could not write to uart!!");
-            let mut buf = [0u8; 1024];
-            let mut file0 = match sdcontroller.open_file_in_dir(&mut sdvol, &root_dir, "JJ0.WAV", embedded_sdmmc::Mode::ReadOnly) {
-                Ok(f) => f,
-                Err(_) => panic!("could not open first file")
-            };
-            let mut nread = 0;  
-            while !file0.eof() { 
-                nread += sdcontroller.read(&sdvol, &mut file0, &mut buf).unwrap();
+    // now search the root directory for songs that match the JJ#.WAV format
+    let mut root_dir = sdvolume.open_root_dir().expect("Failed to open root dir");
+    let mut song_filenames: [Option<embedded_sdmmc::ShortFileName> ; N_SONGS] = Default::default();
+    root_dir.iterate_dir(|entry| {
+        for i in 0..N_SONGS {
+            let start = entry.name.base_name()[0..2] == *b"JJ";
+            let end = entry.name.extension() == b"WAV";
+            let buf = &mut [0u8; 1];
+            NumToA::numtoa(i, 10, buf);
+            let num = entry.name.base_name()[2..3] == *buf;
+            if start && end && num {
+                song_filenames[i] = Some(entry.name.clone());
+                break;
             }
-
-            uart.write_fmt(format_args!("finished read of first file, {nread} bytes\r\n")).expect("Could not write to uart!!");
-
-
-            uart.write_all("Sd card startup completed.".as_bytes()).expect("Could not write to uart!!");
         }
-        Err(e) => {
-            uart.write_fmt(format_args!("Sd card init error: {e:?}")).expect("Could not write to uart!!");
-            panic!("SD card startup failed");
-        }
-    }
-
-
+    }).expect("Failed to iterate root dir");
 
     // Completed setup! entering mainloop
     uart.write_all("started!\n\r".as_bytes()).expect("Could not write start to uart!!");
 
+    let stolencore = unsafe { CorePeripherals::steal() };
+    let mut stolendelay = Delay::new(stolencore.SYST, &mut clocks);
+
     loop {
-        blink_led(&mut status_led, &mut delay, 5, 100);
+        blink_led(&mut status_led, &mut stolendelay, 5, 100);
         panic!("ahhh");
     }
 }
@@ -176,4 +158,20 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
         led.set_low().expect("led setting failed!");
     }
     if started_high { led.set_high().expect("led setting failed!"); }
+}
+
+
+struct FakeClock;
+
+impl embedded_sdmmc::TimeSource for FakeClock {
+    fn get_timestamp(&self) -> embedded_sdmmc::Timestamp {
+        embedded_sdmmc::Timestamp {
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
 }

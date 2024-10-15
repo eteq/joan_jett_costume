@@ -10,12 +10,14 @@ chip = "ATSAMD21G18A"
 
 [dependencies]
 panic-persist = "0.3"
-feather_m0 = "0.14"
+feather_m0 = { version = "0.14", features=["rt", "sdmmc", "adalogger"]}
 cortex-m = "0.7"
-embedded-sdmmc = "0.3"
-
-[features]
-default = ["feather_m0/rt", "feather_m0/sdmmc", "feather_m0/adalogger"]
+embedded-sdmmc = "0.8"
+embedded-hal-bus = "0.2"
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+numtoa = "0.2.4"
+nb = "1.1.0"
+#ringbuf = "0.4.7"
 
 [profile.dev]
 incremental = false
