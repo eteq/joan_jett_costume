@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 
+use ringbuf::traits::Observer;
+use ringbuf::traits::Producer;
+use ringbuf::StaticRb;
 use nb;
 use cortex_m::asm;
 
-use embedded_sdmmc;
-use embedded_sdmmc::{VolumeIdx, VolumeManager, SdCard};
+use embedded_sdmmc::{self, BlockDevice, ShortFileName, TimeSource, Directory, VolumeIdx, VolumeManager, SdCard};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use panic_persist;
 
@@ -119,7 +121,7 @@ fn main() -> ! {
         .expect("Failed to open volume");
 
     // now search the root directory for songs that match the JJ#.WAV format
-    let mut song_filenames: [Option<embedded_sdmmc::ShortFileName> ; N_SONGS] = Default::default();
+    let mut song_filenames: [Option<ShortFileName> ; N_SONGS] = Default::default();
     
     let mut root_dir = sdvolume.open_root_dir().expect("Failed to open root dir");
     root_dir.iterate_dir(|entry| {
@@ -142,40 +144,35 @@ fn main() -> ! {
     let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
     for pin in song_trigger_pins.as_mut() { pin.into_pull_up_input(); }
 
+    // TODO: set up the I2S peripheral
+
+    // need to get a second delay because the main one was taken by the SD card controller
+    // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading. But it's still a bit sketchy.
+    let mut stolendelay = Delay::new(unsafe { CorePeripherals::steal() }.SYST, &mut clocks);
+
     // Completed setup! entering mainloop
     uart.write_all("started!\n\r".as_bytes()).expect("Could not write start to uart!!");
-
-    // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading
-    let mut stolendelay = Delay::new(unsafe { CorePeripherals::steal() }.SYST, &mut clocks);
 
     blink_led(&mut status_led, &mut stolendelay, 5, 100);
     status_led.set_low().expect("led setting failed!");
 
-    let mut song_playing: Option<usize> = None;
     loop {
-        match song_playing {
-            None => {
-                for i in 0..song_trigger_pins.len() {
-                    if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
-                        // do a debounce check
-                        stolendelay.delay_ms(5u8);
-                        if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
-                            uart.write_fmt(format_args!("Starting song {}\r\n", i)).expect("Could not write to uart!!");
-                            start_song(i);
-                            song_playing = Some(i);
-                            break;
+
+        for i in 0..song_trigger_pins.len() {
+            if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
+                // do a debounce check
+                stolendelay.delay_ms(5u8);
+                if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
+                    match song_filenames[i].clone() {
+                        Some(songfn) => {
+                            uart.write_fmt(format_args!("Playing song for trigger {}", i)).expect("Could not write to uart!!");
+                            status_led.set_high().expect("led setting failed!");
+                            play_song(songfn, &song_trigger_pins[i], &mut root_dir, &mut stolendelay);
+                            status_led.set_low().expect("led setting failed!");
+                        },
+                        None => {
+                            uart.write_fmt(format_args!("No song found for trigger {}\r\n", i)).expect("Could not write to uart!!");
                         }
-                    }
-                }
-            },
-            Some(song) => {
-                if song_trigger_pins[song].is_high().expect("Failed to read song trigger pin") {
-                    // do a debounce check
-                    stolendelay.delay_ms(5u8);
-                    if song_trigger_pins[song].is_high().expect("Failed to read song trigger pin") {
-                        uart.write_fmt(format_args!("Stopping song {}\r\n", song)).expect("Could not write to uart!!");
-                        stop_playing();
-                        song_playing = None;
                     }
                 }
             }
@@ -196,14 +193,86 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
     if started_high { led.set_high().expect("led setting failed!"); }
 }
 
-fn start_song(song: usize) {
-    panic!("Song starting not implemented yet!");
+fn play_song<D:BlockDevice,T:TimeSource>(song: ShortFileName, trigger_pin: &hal::gpio::DynPin, dir: &mut Directory<D,T,N_SONGS, N_SONGS, 1>, delay: &mut Delay) {
+    let mut file = dir.open_file_in_dir(song, embedded_sdmmc::Mode::ReadOnly).expect("Failed to open song file");
+
+    let _freq = validate_wav_file(&mut file).unwrap();  // this advances to the start of the data chunk
+
+
+    let mut data_buffer = StaticRb::<i32, 32>::default();
+
+    // TODO: do any necessary configuration of the i2s peripheral
+
+    // playing loop.  Runs until the trigger pin goes high
+    loop {
+        // first (re)-fill the buffer
+        while !data_buffer.is_full() {
+            let buf = &mut [0u8; 4];
+            file.read(buf).expect("failed to read from file");
+            let data = i32::from_le_bytes(*buf);
+            data_buffer.try_push(data).expect("Failed to push data to buffer");
+        }
+
+        // now actually start playing if we haven't already
+        panic!("Song playing not implemented yet!");
+
+        // high means stop, because the trigger pin is active low
+        if trigger_pin.is_high().expect("Failed to read song trigger pin") {
+            // debounce check
+            delay.delay_ms(5u8);
+            if trigger_pin.is_high().expect("Failed to read song trigger pin") {
+                panic!("Song stopping not implemented yet!");
+                break;
+            }
+        }
+    }
 }
 
-fn stop_playing() {
-    panic!("Song stopping not implemented yet!");
+fn validate_wav_file<D:BlockDevice,T:TimeSource>(file: &mut embedded_sdmmc::File<D,T,N_SONGS, N_SONGS, 1>) -> Result<u32, WavError>{
+    file.seek_from_start(0).expect("failed to seek to start of file");
+
+    let buf4 = &mut [0u8; 4];
+    let buf2 = &mut [0u8; 2];
+
+    file.read(buf4).expect("failed to read from file");
+    if buf4 != b"RIFF" { return Err(WavError::InvalidWavError); }
+
+    file.read(buf4).expect("failed to read from file");
+    file.read(buf4).expect("failed to read from file");
+    if buf4 != b"WAVE" { return Err(WavError::InvalidWavError); }
+    file.read(buf4).expect("failed to read from file");
+    if buf4 != b"fmt " { return Err(WavError::InvalidWavError); }
+    file.read(buf4).expect("failed to read from file");
+    if u32::from_le_bytes(*buf4) != 16 { return Err(WavError::InvalidWavError); }
+
+    file.read(buf2).expect("failed to read from file");
+    let audio_format = u16::from_le_bytes(*buf2);
+    file.read(buf2).expect("failed to read from file");
+    let nchan = u16::from_le_bytes(*buf2);
+    file.read(buf4).expect("failed to read from file");
+    let freq = u32::from_le_bytes(*buf4);
+    file.read(buf4).expect("failed to read from file");
+    let _bytepersec = u32::from_le_bytes(*buf4);
+    file.read(buf2).expect("failed to read from file");
+    let _byteperblock = u16::from_le_bytes(*buf2);
+    file.read(buf2).expect("failed to read from file");
+    let bitspersample = u16::from_le_bytes(*buf2);
+
+    file.read(buf4).expect("failed to read from file");
+    if buf4 != b"data" { return Err(WavError::InvalidWavError); }
+
+    if audio_format != 1 { return Err(WavError::IncorrectWavFormatError); }
+    if nchan != 1 { return Err(WavError::IncorrectWavFormatError); }
+    if bitspersample != 16 { return Err(WavError::IncorrectWavFormatError); }
+
+    Ok(freq)
 }
 
+#[derive(Debug, Clone)]
+enum WavError {
+    InvalidWavError,
+    IncorrectWavFormatError,
+}
 
 struct FakeClock;
 

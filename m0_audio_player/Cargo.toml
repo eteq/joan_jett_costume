@@ -17,7 +17,7 @@ embedded-hal-bus = "0.2"
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
 numtoa = "0.2.4"
 nb = "1.1.0"
-#ringbuf = "0.4.7"
+ringbuf = { version = "0.4.7", default-features = false, features = ["portable-atomic"] }
 
 [profile.dev]
 incremental = false
