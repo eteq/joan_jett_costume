@@ -20,9 +20,9 @@ use pac::{CorePeripherals, Peripherals};
 
 use numtoa::NumToA;
 
+const SD_CARD_KHZ: u32 = 4000;
 const VOL_IDX: usize = 0;
 const N_SONGS: usize = 6;
-const SD_CARD_KHZ: u32 = 4000;
 
 #[entry]
 fn main() -> ! {
@@ -113,14 +113,15 @@ fn main() -> ! {
     // now start up the SD controller
     let sdmmc_spi = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).expect("Failed to create SpiDevice");
     let card = SdCard::new(sdmmc_spi, delay);
-    let mut volume_mgr: VolumeManager<_, _, 1, N_SONGS, 1> = VolumeManager::new_with_limits(card, FakeClock {}, 0);
+    let mut volume_mgr: VolumeManager<_, _, N_SONGS, N_SONGS, 1> = VolumeManager::new_with_limits(card, FakeClock {}, 0);
     let mut sdvolume = volume_mgr
         .open_volume(VolumeIdx(VOL_IDX))
         .expect("Failed to open volume");
 
     // now search the root directory for songs that match the JJ#.WAV format
-    let mut root_dir = sdvolume.open_root_dir().expect("Failed to open root dir");
     let mut song_filenames: [Option<embedded_sdmmc::ShortFileName> ; N_SONGS] = Default::default();
+    
+    let mut root_dir = sdvolume.open_root_dir().expect("Failed to open root dir");
     root_dir.iterate_dir(|entry| {
         for i in 0..N_SONGS {
             let start = entry.name.base_name()[0..2] == *b"JJ";
@@ -135,15 +136,50 @@ fn main() -> ! {
         }
     }).expect("Failed to iterate root dir");
 
+    // note: it would be better if we could actually open the files above but mutability creates all kinds of issues that won't be fixed until embedded_sdmmc > 0.8    
+
+    // set up the song trigger pins
+    let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
+    for pin in song_trigger_pins.as_mut() { pin.into_pull_up_input(); }
+
     // Completed setup! entering mainloop
     uart.write_all("started!\n\r".as_bytes()).expect("Could not write start to uart!!");
 
-    let stolencore = unsafe { CorePeripherals::steal() };
-    let mut stolendelay = Delay::new(stolencore.SYST, &mut clocks);
+    // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading
+    let mut stolendelay = Delay::new(unsafe { CorePeripherals::steal() }.SYST, &mut clocks);
 
+    blink_led(&mut status_led, &mut stolendelay, 5, 100);
+    status_led.set_low().expect("led setting failed!");
+
+    let mut song_playing: Option<usize> = None;
     loop {
-        blink_led(&mut status_led, &mut stolendelay, 5, 100);
-        panic!("ahhh");
+        match song_playing {
+            None => {
+                for i in 0..song_trigger_pins.len() {
+                    if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
+                        // do a debounce check
+                        stolendelay.delay_ms(5u8);
+                        if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
+                            uart.write_fmt(format_args!("Starting song {}\r\n", i)).expect("Could not write to uart!!");
+                            start_song(i);
+                            song_playing = Some(i);
+                            break;
+                        }
+                    }
+                }
+            },
+            Some(song) => {
+                if song_trigger_pins[song].is_high().expect("Failed to read song trigger pin") {
+                    // do a debounce check
+                    stolendelay.delay_ms(5u8);
+                    if song_trigger_pins[song].is_high().expect("Failed to read song trigger pin") {
+                        uart.write_fmt(format_args!("Stopping song {}\r\n", song)).expect("Could not write to uart!!");
+                        stop_playing();
+                        song_playing = None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -158,6 +194,14 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
         led.set_low().expect("led setting failed!");
     }
     if started_high { led.set_high().expect("led setting failed!"); }
+}
+
+fn start_song(song: usize) {
+    panic!("Song starting not implemented yet!");
+}
+
+fn stop_playing() {
+    panic!("Song stopping not implemented yet!");
 }
 
 
