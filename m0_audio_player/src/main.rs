@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-use ringbuf::traits::Observer;
-use ringbuf::traits::Producer;
-use ringbuf::StaticRb;
 use nb;
 use cortex_m::asm;
+
+use ringbuf::StaticRb;
+use ringbuf::traits::{Consumer, Producer, Observer};
 
 use embedded_sdmmc::{self, BlockDevice, ShortFileName, TimeSource, Directory, VolumeIdx, VolumeManager, SdCard};
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -13,11 +13,13 @@ use panic_persist;
 
 use bsp::hal;
 use bsp::pac;
-use feather_m0::{self as bsp, ehal::digital::StatefulOutputPin, hal::{embedded_io::Write, gpio::{Output, PushPull}}};
+use feather_m0::{self as bsp, ehal::digital::StatefulOutputPin, hal::{embedded_io::Write, gpio, gpio::{Output, PushPull}}};
 
 use bsp::{entry, periph_alias, pin_alias};
 use hal::delay::Delay;
 use hal::prelude::*;
+use hal::sercom::uart;
+
 use pac::{CorePeripherals, Peripherals};
 
 use numtoa::NumToA;
@@ -37,6 +39,7 @@ fn main() -> ! {
         &mut peripherals.SYSCTRL,
         &mut peripherals.NVMCTRL,
     );
+    let gclk0 = clocks.gclk0();
     let mut pm = peripherals.PM;
     let pins = bsp::Pins::new(peripherals.PORT);
 
@@ -46,17 +49,23 @@ fn main() -> ! {
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
     // Setup UART peripheral and pins
-    let uart_sercom = periph_alias!(peripherals.uart_sercom);
-    let uart_rx_pin = pin_alias!(pins.uart_rx);
-    let uart_tx_pin = pin_alias!(pins.uart_tx);
-    let mut uart = bsp::uart(
-        &mut clocks,
-        9600.Hz(),
-        uart_sercom,
-        &mut pm,
-        uart_rx_pin,
-        uart_tx_pin,
-    );
+    // this uses the labeled pins... but we can't do that because it conflicts with I2S pins.  So use an alternative pin pair
+    // let mut uart = bsp::uart(
+    //     &mut clocks,
+    //     9600.Hz(),
+    //     periph_alias!(peripherals.uart_sercom),
+    //     &mut pm,
+    //     pin_alias!(pins.uart_rx),
+    //     pin_alias!(pins.uart_tx),
+    // );
+    let uart_clock = clocks.sercom1_core(&gclk0).unwrap();
+    let uart_sercom = peripherals.SERCOM1;
+    let uart_pads = uart::Pads::default()
+                    .rx(pins.d11.into_alternate::<gpio::C>())
+                    .tx(pins.d10.into_alternate::<gpio::C>());
+    let mut uart = uart::Config::new(&pm, uart_sercom, uart_pads, uart_clock.freq())
+        .baud(57600.Hz(), uart::BaudMode::Fractional(uart::Oversampling::Bits16))
+        .enable();
 
     // write any panic message - do this first before any other setup
     if let Some(msg) = panic_persist::get_panic_message_bytes() {
@@ -143,8 +152,61 @@ fn main() -> ! {
     // set up the song trigger pins
     let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
     for pin in song_trigger_pins.as_mut() { pin.into_pull_up_input(); }
+    
 
-    // TODO: set up the I2S peripheral
+    //----------START I2S STARTUP-----------
+    let _i2s_fs = pins.d0.into_alternate::<hal::gpio::G>();
+    let _i2s_sck = pins.d1.into_alternate::<hal::gpio::G>();
+    let _i2s_sd = pins.d12.into_alternate::<hal::gpio::G>();
+
+    // turn on i2s bus clock
+    pm.apbcmask.modify(|_, w| {w.i2s_().set_bit()});
+
+    // first set the sample rate and relevant parameters to work out the clock frequency
+
+    let sample_rate: u32 = 22_050;
+    let bits_per_sample: u32 = 16;
+    let nchannels: u32 = 1;
+    let fsck = sample_rate * bits_per_sample * nchannels;
+    let div: u16 = (48_000_000 / fsck).try_into().expect("audio clock divisor doesnt fit in 16 bits");
+
+    // configure a clock generator for the needed frequency and connect it to the i2s clocks
+    let gclk3 = clocks.configure_gclk_divider_and_source(
+                hal::clock::ClockGenId::GCLK3,
+                div, 
+                hal::clock::ClockSource::DFLL48M, 
+                true).expect("the gclk for i2s is already configured!");
+    let _i2s_clock0 = clocks.i2s0(&gclk3);
+    let _i2s_clock1 = clocks.i2s1(&gclk3);
+
+    // now configure the i2s registers and enable the clock but not the serializer
+    // first do a reset just in  case
+    peripherals.I2S.ctrla.write(|w| w.swrst().set_bit());
+    // wait for reset to complete
+    while peripherals.I2S.syncbusy.read().swrst().bit_is_set() {}
+    while peripherals.I2S.ctrla.read().swrst().bit_is_set() {}
+
+    // set up the clock unit
+    peripherals.I2S.clkctrl[0].write(|w| {
+        w.bitdelay().set_bit()  // not entirely sure about this one...
+            .slotsize()._16()
+    });
+    // and the serializer
+    peripherals.I2S.serctrl[0].write(|w| {
+        w.mono().set_bit()
+            .datasize()._16()
+            .clksel().clk0()
+            .txsame().set_bit()
+            .txdefault().hiz()
+            .sermode().tx()
+    });
+    // wait for sync to complete
+    while peripherals.I2S.syncbusy.read().bits() != 0 {}
+
+    // now we do not enable it because we only do that when we need to play sound
+    
+    //----------END I2S STARTUP-----------
+
 
     // need to get a second delay because the main one was taken by the SD card controller
     // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading. But it's still a bit sketchy.
@@ -167,7 +229,7 @@ fn main() -> ! {
                         Some(songfn) => {
                             uart.write_fmt(format_args!("Playing song for trigger {}", i)).expect("Could not write to uart!!");
                             status_led.set_high().expect("led setting failed!");
-                            play_song(songfn, &song_trigger_pins[i], &mut root_dir, &mut stolendelay);
+                            play_song(songfn, &mut peripherals.I2S, &song_trigger_pins[i], &mut root_dir, &mut stolendelay);
                             status_led.set_low().expect("led setting failed!");
                         },
                         None => {
@@ -193,35 +255,96 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
     if started_high { led.set_high().expect("led setting failed!"); }
 }
 
-fn play_song<D:BlockDevice,T:TimeSource>(song: ShortFileName, trigger_pin: &hal::gpio::DynPin, dir: &mut Directory<D,T,N_SONGS, N_SONGS, 1>, delay: &mut Delay) {
+fn play_song<D:BlockDevice,T:TimeSource>(song: ShortFileName, 
+                                         i2s : &mut pac::I2S, 
+                                         trigger_pin: &hal::gpio::DynPin, 
+                                         dir: &mut Directory<D,T,N_SONGS, N_SONGS, 1>, 
+                                         delay: &mut Delay) {
     let mut file = dir.open_file_in_dir(song, embedded_sdmmc::Mode::ReadOnly).expect("Failed to open song file");
 
-    let _freq = validate_wav_file(&mut file).unwrap();  // this advances to the start of the data chunk
+    let freq = validate_wav_file(&mut file).unwrap();  // this advances to the start of the data chunk
+    if freq != 22_050 { panic!("Only 22.05kHz sample rate is currently supported!"); }
 
 
-    let mut data_buffer = StaticRb::<i32, 32>::default();
+    let mut data_buffer = StaticRb::<i16, 32>::default(); 
 
-    // TODO: do any necessary configuration of the i2s peripheral
+    // First read out a single sample to initialize, and fill the buffer
+    let samplebuf = &mut [0u8; 2];
+    let data0 = i16::from_le_bytes(*samplebuf);
+    while !data_buffer.is_full() {
+        file.read(samplebuf).expect("failed to read from file");
+        let data = i16::from_le_bytes(*samplebuf);
+        data_buffer.try_push(data).expect("Failed to push data to buffer");
+    }
 
+    // add the first sample to the i2s buffer
+    //while i2s.syncbusy.read().data0().bit_is_set() {}  // this seems to work at least the first time
+    i2s.data[0].write(|w| unsafe { w.data().bits(data0 as u16 as u32) });
+    //while i2s.syncbusy.read().data0().bit_is_set() {} // but this doesn't...? I guess maybe the peripheral has to be running
+
+    // enable the i2s clock0, ser0, and peripheral and wait for sync
+    i2s.ctrla.write(|w| {
+        w.cken0().set_bit()
+         .seren0().set_bit()
+         .enable().set_bit()
+         .cken1().clear_bit()
+         .seren1().clear_bit()
+         .swrst().clear_bit()
+    });
+    while i2s.syncbusy.read().bits() != 0 {}
+
+    
     // playing loop.  Runs until the trigger pin goes high
     loop {
-        // first (re)-fill the buffer
-        while !data_buffer.is_full() {
-            let buf = &mut [0u8; 4];
-            file.read(buf).expect("failed to read from file");
-            let data = i32::from_le_bytes(*buf);
-            data_buffer.try_push(data).expect("Failed to push data to buffer");
+        if data_buffer.is_empty() {
+            // this probably means we've finished the song, but lets just confirm it's not because we've fallen behind
+            if !file.is_eof() { panic!("Data buffer empty but file not at EOF! Probably can't keep up."); }
+
+            // we don't stop the peripheral, we just let it run and accept the possible underrun.
+            
+            // re-initialize the file to the start of the data
+            validate_wav_file(&mut file).expect("couldn't seek back to start of file!");
+
+            // now re-fill the buffer, clear any underrun, and continue
+            while !data_buffer.is_full() {
+                file.read(samplebuf).expect("failed to read from file");
+                data_buffer.try_push(i16::from_le_bytes(*samplebuf)).expect("Failed to push data to buffer");
+            }
+            i2s.intenclr.write(|w| w.txur0().set_bit());
         }
 
-        // now actually start playing if we haven't already
-        panic!("Song playing not implemented yet!");
+        // first check if new data is needed, pull that from the buffer before anything else. 
+        //Not sure we need to check on the sync bit but it seems  safer
+
+        if i2s.syncbusy.read().data0().bit_is_clear() && i2s.intflag.read().txrdy0().bit_is_set() {
+            let data = data_buffer.try_pop().expect("Failed to pop data from buffer");
+            i2s.data[0].write(|w| unsafe { w.data().bits(data as u16 as u32) });
+            continue; // just in case we are running a bit behind
+        }
+        
+        if i2s.intflag.read().txur0().bit_is_set() {
+            panic!("pre-underrun");
+        }
+
+        // now (re)-fill the buffer if needed unless the file has run out
+        // PROBLEM: this read takes too long and the buffer underruns.  Guess we need to use the interrupt or DMA.
+        while !data_buffer.is_full() && !file.is_eof() {
+            file.read(samplebuf).expect("failed to read from file");
+            data_buffer.try_push(i16::from_le_bytes(*samplebuf)).expect("Failed to push data to buffer");
+        }
+
+        if i2s.intflag.read().txur0().bit_is_set() {
+            panic!("post-underrun");
+        }
 
         // high means stop, because the trigger pin is active low
         if trigger_pin.is_high().expect("Failed to read song trigger pin") {
             // debounce check
             delay.delay_ms(5u8);
             if trigger_pin.is_high().expect("Failed to read song trigger pin") {
-                panic!("Song stopping not implemented yet!");
+                // stop the i2s peripheral, wait for sync and then drop out of the playing loop
+                i2s.ctrla.write(|w| unsafe{w.bits(0)} );
+                while i2s.syncbusy.read().bits() != 0 {}
                 break;
             }
         }
