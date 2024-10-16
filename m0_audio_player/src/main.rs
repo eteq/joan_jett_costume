@@ -212,6 +212,11 @@ fn main() -> ! {
     // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading. But it's still a bit sketchy.
     let mut stolendelay = Delay::new(unsafe { CorePeripherals::steal() }.SYST, &mut clocks);
 
+    let rtc_clock = clocks.rtc(&gclk0).unwrap();
+    let rtc = hal::rtc::Rtc::count32_mode(peripherals.RTC, rtc_clock.freq(), &mut pm);
+    rtc.count32();
+    
+
     // Completed setup! entering mainloop
     uart.write_all("started!\n\r".as_bytes()).expect("Could not write start to uart!!");
 
@@ -229,7 +234,7 @@ fn main() -> ! {
                         Some(songfn) => {
                             uart.write_fmt(format_args!("Playing song for trigger {}", i)).expect("Could not write to uart!!");
                             status_led.set_high().expect("led setting failed!");
-                            play_song(songfn, &mut peripherals.I2S, &song_trigger_pins[i], &mut root_dir, &mut stolendelay);
+                            play_song(songfn, &mut peripherals.I2S, &song_trigger_pins[i], &mut root_dir, &mut stolendelay, &rtc);
                             status_led.set_low().expect("led setting failed!");
                         },
                         None => {
@@ -259,7 +264,8 @@ fn play_song<D:BlockDevice,T:TimeSource>(song: ShortFileName,
                                          i2s : &mut pac::I2S, 
                                          trigger_pin: &hal::gpio::DynPin, 
                                          dir: &mut Directory<D,T,N_SONGS, N_SONGS, 1>, 
-                                         delay: &mut Delay) {
+                                         delay: &mut Delay,
+                                        rtc: &hal::rtc::Rtc<hal::rtc::Count32Mode>) {
     let mut file = dir.open_file_in_dir(song, embedded_sdmmc::Mode::ReadOnly).expect("Failed to open song file");
 
     let freq = validate_wav_file(&mut file).unwrap();  // this advances to the start of the data chunk
@@ -316,25 +322,30 @@ fn play_song<D:BlockDevice,T:TimeSource>(song: ShortFileName,
         // first check if new data is needed, pull that from the buffer before anything else. 
         //Not sure we need to check on the sync bit but it seems  safer
 
+        let c1 = rtc.count32();
         if i2s.syncbusy.read().data0().bit_is_clear() && i2s.intflag.read().txrdy0().bit_is_set() {
             let data = data_buffer.try_pop().expect("Failed to pop data from buffer");
             i2s.data[0].write(|w| unsafe { w.data().bits(data as u16 as u32) });
             continue; // just in case we are running a bit behind
         }
+        let c2 = rtc.count32();
         
         if i2s.intflag.read().txur0().bit_is_set() {
-            panic!("pre-underrun");
+            panic!("pre-underrun, {}-{}", c2, c1);
         }
 
         // now (re)-fill the buffer if needed unless the file has run out
-        // PROBLEM: this read takes too long and the buffer underruns.  Guess we need to use the interrupt or DMA.
+        // PROBLEM: this read takes too long and the buffer underruns.  Guess we need to use the interrupt to feed from the buffer or something
+        let c3 = rtc.count32();
         while !data_buffer.is_full() && !file.is_eof() {
-            file.read(samplebuf).expect("failed to read from file");
+            let buf = &mut [0u8; 256];
+            file.read(buf).expect("failed to read from file");
             data_buffer.try_push(i16::from_le_bytes(*samplebuf)).expect("Failed to push data to buffer");
         }
+        let c4 = rtc.count32();
 
         if i2s.intflag.read().txur0().bit_is_set() {
-            panic!("post-underrun");
+            panic!("post-underrun, {}-{},{}-{}", c2, c1, c4, c3);
         }
 
         // high means stop, because the trigger pin is active low
