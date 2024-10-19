@@ -191,10 +191,10 @@ fn main() -> ! {
                 hal::clock::ClockSource::DFLL48M, 
                 true).expect("the gclk for i2s is already configured!");
     let _i2s_clock0 = clocks.i2s0(&i2s_gclk);
-    let _i2s_clock1 = clocks.i2s1(&i2s_gclk);
+    let _i2s_clock1 = clocks.i2s1(&i2s_gclk);  // we aren't neccessarly using this but just in case...
 
     // now configure the i2s registers and enable the clock but not the serializer
-    // first do a reset just in  case
+    // first do a reset just in case
     peripherals.I2S.ctrla.write(|w| w.swrst().set_bit());
     // wait for reset to complete
     while peripherals.I2S.syncbusy.read().swrst().bit_is_set() {}
@@ -202,17 +202,20 @@ fn main() -> ! {
 
     // set up the clock unit
     peripherals.I2S.clkctrl[0].write(|w| {
-        w.bitdelay().set_bit()  // not entirely sure about this one...
-            .slotsize()._16()
+        w.slotsize()._16()
+         .bitdelay().set_bit()  // not entirely sure about this one...
     });
     // and the serializer
     peripherals.I2S.serctrl[0].write(|w| {
         w.mono().set_bit()
             .datasize()._16()
+            //.datasize()._16c() //?
             .clksel().clk0()
             .txsame().set_bit()
             .txdefault().hiz()
             .sermode().tx()
+            .extend().msbit() //?
+            .slotadj().left() //?
     });
     // wait for sync to complete
     while peripherals.I2S.syncbusy.read().bits() != 0 {}
@@ -225,13 +228,16 @@ fn main() -> ! {
         pac::NVIC::unmask(pac::interrupt::I2S);
     }
 
+    // now we enable the peripheral and wait on sync but don't start the clock or serializer - wait on that for the song start
+    peripherals.I2S.ctrla.modify(|_,w| w.enable().set_bit());
+    while peripherals.I2S.syncbusy.read().bits() != 0 {}
+
     // send off the i2s peripheral to the global and set up the data buffer while we're at it, since we need these there once I2S is  enabled
     cortex_m::interrupt::free(|cs| {
         I2S_PERIPHERAL.borrow(cs).replace(Some(peripherals.I2S));
         DATA_BUFFER.borrow(cs).replace(Some(ArrayDeque::new()));
     });
 
-    // now we do not enable it because we only do that when we need to play sound
     
     //----------END I2S STARTUP-----------
 
@@ -392,19 +398,13 @@ fn start_i2s(data0: u32) {
         // add the first sample to the i2s buffer
         i2s.data[0].write(|w| unsafe { w.data().bits(data0) });
 
-        // enable the i2s clock0, ser0, and wait for sync, then enable the peripheral
-        i2s.ctrla.write(|w| {
-            w.cken0().set_bit()
-            .seren0().set_bit()
-            .enable().set_bit()
-            .cken1().clear_bit()
-            .seren1().clear_bit()
-            .swrst().clear_bit()
-        });
-        unsafe { if SONG_COUNTER > 1 { panic!("here!"); } }
-        while i2s.syncbusy.read().bits() != 0 {}
+        // enable the i2s clock0, ser0, and wait for sync in between
 
-    unsafe { if SONG_COUNTER > 1 { panic!("huzzah!"); } }
+        i2s.ctrla.modify(|_,w| { w.cken0().set_bit() });
+        while i2s.syncbusy.read().cken0().bit_is_set() {}
+        i2s.ctrla.modify(|_,w| { w.seren0().set_bit() });
+        while i2s.syncbusy.read().seren0().bit_is_set() {}
+
     });
 }
 
@@ -414,9 +414,11 @@ fn stop_i2s() -> bool {
         let mut i2s = I2S_PERIPHERAL.borrow(cs).borrow_mut();
         let i2s = i2s.as_mut().expect("I2S peripheral variable not initialized");
 
-        i2s.ctrla.write(|w| w.enable().clear_bit());
-        while i2s.syncbusy.read().enable().bit_is_set() {}
-
+        i2s.ctrla.modify(|_,w| w.seren0().clear_bit()); 
+        while i2s.syncbusy.read().seren0().bit_is_set() {} // wait for the disable to complete
+        i2s.ctrla.modify(|_,w| w.cken0().clear_bit()); 
+        while i2s.syncbusy.read().cken0().bit_is_set() {} // wait for the disable to complete
+        
         underrun = i2s.intflag.read().txur0().bit_is_set();
         // reset the interrupts just in case too once it's been disabled
         i2s.intflag.write(|w| w.txur0().set_bit().txrdy0().set_bit());
@@ -497,7 +499,8 @@ fn I2S() {
         let data = data_buffer.pop_front().expect("Data buffer underflow!!!");  // could instead just let it ride to skip...
 
         // write the next sample to the i2s peripheral
-        i2s.data[0].write(|w| unsafe { w.data().bits(data as u16 as u32) });
+        let mut datamod = data as u16 as u32;
+        i2s.data[0].write(|w| unsafe { w.data().bits(datamod ) });
         // note the interrupt is cleared by writing the data register so we don't have to do it explicitly
     });
 }
