@@ -9,6 +9,7 @@ authors = ["Erik Tollerud <erik.tollerud@gmail.com>"]
 chip = "ATSAMD21G18A"
 
 [dependencies]
+panic-halt = "0.2"
 panic-persist = "0.3"
 feather_m0 = { version = "0.14", features=["rt", "sdmmc", "adalogger"]}
 cortex-m = "0.7"
@@ -29,3 +30,11 @@ lto = false
 debug = true
 lto = true
 opt-level = "s"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[[bin]]
+name = "minimal"
+path = "src/minimal_i2s.rs"
