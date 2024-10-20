@@ -23,11 +23,11 @@ use nb;
 use numtoa::NumToA;
 use arraydeque::ArrayDeque;
 
-const SD_CARD_KHZ: u32 = 4000;
+const SD_CARD_KHZ: u32 = 6000;
 const VOL_IDX: usize = 0;
 const N_SONGS: usize = 6;
 
-const BUFFER_CAPACITY: usize = 512;
+const BUFFER_CAPACITY: usize = 2048;
 static DATA_BUFFER: Mutex<RefCell<Option<ArrayDeque<i16, BUFFER_CAPACITY>>>> = Mutex::new(RefCell::new(None));
 static I2S_PERIPHERAL: Mutex<RefCell<Option<pac::I2S>>> = Mutex::new(RefCell::new(None));
 
@@ -174,25 +174,27 @@ fn main() -> ! {
 
     // first set the sample rate and relevant parameters to work out the clock frequency
 
-    let sample_rate: u32 = 22_050;
     let bits_per_sample: u32 = 16;
     let nchannels: u32 = 1;
-    let fsck = sample_rate * bits_per_sample * nchannels;
-    let div: u16 = (48_000_000 / fsck).try_into().expect("audio clock divisor doesnt fit in 16 bits");
 
-    uart.write_fmt(format_args!("setting div as {} for rate {} which yields a true sample rate of {}\r\n", 
-                                div, sample_rate, 48_000_000 as f32 / div as f32/ (bits_per_sample * nchannels) as f32))
-        .expect("Could not write to uart!!");
+    let fsck441 = 44_100 * bits_per_sample * nchannels;
+    let clock_div_base441: u16 = (48_000_000 / fsck441).try_into().expect("audio clock divisor doesnt fit in 16 bits");
 
-    // configure a clock generator for the needed frequency and connect it to the i2s clocks
+    let fsck48 = 48_000 * bits_per_sample * nchannels;
+    let clock_div_base48: u16 = (48_000_000 / fsck48).try_into().expect("audio clock divisor doesnt fit in 16 bits");
+
+
+    // configure a clock generator for the needed frequencies and connect the slower one to the i2s clocks
     let i2s_gclk = clocks.configure_gclk_divider_and_source(
                 hal::clock::ClockGenId::GCLK3,
-                div, 
+                clock_div_base441, 
                 hal::clock::ClockSource::DFLL48M, 
                 true).expect("the gclk for i2s is already configured!");
-    let _i2s_clock0 = clocks.i2s0(&i2s_gclk);
-    let _i2s_clock1 = clocks.i2s1(&i2s_gclk);  // we aren't neccessarly using this but just in case...
 
+    // configure a clock generator for the needed frequencies and connect the slower one to the i2s clocks
+
+    let _i2s_clock0 = clocks.i2s0(&i2s_gclk).unwrap();
+    
     // now configure the i2s registers and enable the clock but not the serializer
     // first do a reset just in case
     peripherals.I2S.ctrla.write(|w| w.swrst().set_bit());
@@ -200,11 +202,27 @@ fn main() -> ! {
     while peripherals.I2S.syncbusy.read().swrst().bit_is_set() {}
     while peripherals.I2S.ctrla.read().swrst().bit_is_set() {}
 
-    // set up the clock unit
-    peripherals.I2S.clkctrl[0].write(|w| {
-        w.slotsize()._16()
-         .bitdelay().set_bit()  // not entirely sure about this one...
-    });
+
+    for clkctrl in peripherals.I2S.clkctrl.iter() {
+        clkctrl.write(|w| {
+            unsafe {
+                w.slotsize()._16()
+                .fswidth().half()
+                .fsoutinv().set_bit()
+                .nbslots().bits(1)
+                .bitdelay().set_bit() 
+            }
+        });
+    }
+    // peripherals.I2S.clkctrl[0].write(|w| {
+    //     unsafe {
+    //         w.slotsize()._16()
+    //             .fswidth().half()
+    //             .fsoutinv().set_bit()
+    //             .nbslots().bits(1)
+    //             .bitdelay().set_bit() 
+    //     }
+    // });
     // and the serializer
     peripherals.I2S.serctrl[0].write(|w| {
         w.mono().set_bit()
@@ -257,6 +275,7 @@ fn main() -> ! {
     blink_led(&mut status_led, &mut stolendelay, 5, 100);
     status_led.set_low().expect("led setting failed!");
 
+    let stolen_gclk = unsafe { Peripherals::steal() }.GCLK;
     loop {
         for i in 0..song_trigger_pins.len() {
             if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
@@ -268,6 +287,46 @@ fn main() -> ! {
                             uart.write_fmt(format_args!("Playing song for trigger {}\r\n", i)).expect("Could not write to uart!!");
                             let mut songfile = root_dir.open_file_in_dir(songfn, embedded_sdmmc::Mode::ReadOnly).expect("Failed to open song file");
                             status_led.set_high().expect("led setting failed!");
+                            let freq = validate_wav_file(&mut songfile).unwrap();  // this advances to the start of the data chunk
+                            match freq {
+                                44_100 => {
+                                    uart.write_fmt(format_args!("Playing 44.1kHz w/ div {}\r\n", clock_div_base441)).expect("Could not write to uart!!");
+                                    stolen_gclk.gendiv.write(|w| {
+                                        unsafe {
+                                            w.id().bits(3)
+                                                .div().bits(clock_div_base441)
+                                        }
+                                    });
+                                },
+                                22_050 => {
+                                    uart.write_fmt(format_args!("Playing 22.05kHz w/ div {}\r\n", clock_div_base441*2)).expect("Could not write to uart!!");
+                                    stolen_gclk.gendiv.write(|w| {
+                                        unsafe {
+                                            w.id().bits(3)
+                                                .div().bits(clock_div_base441*2)
+                                        }
+                                    });
+                                },
+                                48_000 => {
+                                    uart.write_fmt(format_args!("Playing 48kHz w/ div {}\r\n", clock_div_base48)).expect("Could not write to uart!!");
+                                    stolen_gclk.gendiv.write(|w| {
+                                        unsafe {
+                                            w.id().bits(3)
+                                                .div().bits(clock_div_base48)
+                                        }
+                                    });
+                                },
+                                24_000 => {
+                                    uart.write_fmt(format_args!("Playing 24kHz w/ div {}\r\n", clock_div_base48*2)).expect("Could not write to uart!!");
+                                    stolen_gclk.gendiv.write(|w| {
+                                        unsafe {
+                                            w.id().bits(3)
+                                                .div().bits(clock_div_base48*2)
+                                        }
+                                    });
+                            },
+                                _ => { panic!("Only 22.05/24/44.1/48 kHz sample rates are currently supported!"); }
+                            }
                             let completed = play_song(&mut songfile, &song_trigger_pins[i], &mut stolendelay);
                             status_led.set_low().expect("led setting failed!");
                             songfile.close().expect("Failed to close song file");
@@ -297,15 +356,10 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
     if started_high { led.set_high().expect("led setting failed!"); }
 }
 
-static mut SONG_COUNTER: usize = 0;
-
 fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1>,
                                          trigger_pin: &hal::gpio::DynPin, 
                                          delay: &mut Delay) -> bool{
-    unsafe { SONG_COUNTER += 1; } 
-    
-    let freq = validate_wav_file(file).unwrap();  // this advances to the start of the data chunk
-    if freq != 22_050 { panic!("Only 22.05kHz sample rate is currently supported!"); }
+    // not the file should already be validated and at the start of the data section
 
     // First read out a single sample to initialize
     let samplebuf = &mut [0u8; 2];
@@ -433,15 +487,15 @@ fn validate_wav_file<D:BlockDevice,T:TimeSource>(file: &mut embedded_sdmmc::File
     let buf2 = &mut [0u8; 2];
 
     file.read(buf4).expect("failed to read from file");
-    if buf4 != b"RIFF" { return Err(WavError::InvalidWavError); }
+    if buf4 != b"RIFF" { return Err(WavError::InvalidWavError(1)); }
 
     file.read(buf4).expect("failed to read from file");
     file.read(buf4).expect("failed to read from file");
-    if buf4 != b"WAVE" { return Err(WavError::InvalidWavError); }
+    if buf4 != b"WAVE" { return Err(WavError::InvalidWavError(2)); }
     file.read(buf4).expect("failed to read from file");
-    if buf4 != b"fmt " { return Err(WavError::InvalidWavError); }
+    if buf4 != b"fmt " { return Err(WavError::InvalidWavError(3)); }
     file.read(buf4).expect("failed to read from file");
-    if u32::from_le_bytes(*buf4) != 16 { return Err(WavError::InvalidWavError); }
+    if u32::from_le_bytes(*buf4) != 16 { return Err(WavError::InvalidWavError(4)); }
 
     file.read(buf2).expect("failed to read from file");
     let audio_format = u16::from_le_bytes(*buf2);
@@ -457,19 +511,21 @@ fn validate_wav_file<D:BlockDevice,T:TimeSource>(file: &mut embedded_sdmmc::File
     let bitspersample = u16::from_le_bytes(*buf2);
 
     file.read(buf4).expect("failed to read from file");
-    if buf4 != b"data" { return Err(WavError::InvalidWavError); }
+    if buf4 != b"data" { return Err(WavError::InvalidWavError(5)); }
 
-    if audio_format != 1 { return Err(WavError::IncorrectWavFormatError); }
-    if nchan != 1 { return Err(WavError::IncorrectWavFormatError); }
-    if bitspersample != 16 { return Err(WavError::IncorrectWavFormatError); }
+    if audio_format != 1 { return Err(WavError::IncorrectWavFormatError(1)); }
+    if nchan != 1 { return Err(WavError::IncorrectWavFormatError(2)); }
+    if bitspersample != 16 { return Err(WavError::IncorrectWavFormatError(3)); }
 
     Ok(freq)
 }
 
 #[derive(Debug, Clone)]
 enum WavError {
-    InvalidWavError,
-    IncorrectWavFormatError,
+    #[allow(dead_code)]
+    InvalidWavError(u8),
+    #[allow(dead_code)]
+    IncorrectWavFormatError(u8),
 }
 
 struct FakeClock;
@@ -499,8 +555,8 @@ fn I2S() {
         let data = data_buffer.pop_front().expect("Data buffer underflow!!!");  // could instead just let it ride to skip...
 
         // write the next sample to the i2s peripheral
-        let mut datamod = data as u16 as u32;
-        i2s.data[0].write(|w| unsafe { w.data().bits(datamod ) });
+        let datamod = data as u16 as u32;
+        i2s.data[0].write(|w| unsafe { w.data().bits(datamod) });
         // note the interrupt is cleared by writing the data register so we don't have to do it explicitly
     });
 }

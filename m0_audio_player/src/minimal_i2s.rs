@@ -77,7 +77,7 @@ fn main() -> ! {
          .fswidth().half()
          .fsoutinv().set_bit()
          .nbslots().bits(1)
-         .bitdelay().set_bit()  // not entirely sure about this one...
+         .bitdelay().set_bit() 
     });}
     // and the serializer
     peripherals.I2S.serctrl[0].write(|w| {
