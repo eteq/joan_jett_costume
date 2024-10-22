@@ -11,7 +11,7 @@ use panic_persist;
 
 use bsp::{hal, pac, entry, periph_alias, pin_alias};
 
-use feather_m0::{self as bsp, ehal::digital::StatefulOutputPin, hal::{embedded_io::Write, gpio, gpio::{Output, PushPull}}};
+use feather_m0::{self as bsp, ehal::digital::StatefulOutputPin, hal::{embedded_io::Write, gpio::{self, Output, PushPull}}};
 
 use hal::delay::Delay;
 use hal::prelude::*;
@@ -160,8 +160,19 @@ fn main() -> ! {
     // note: it would be better if we could actually open the files above but mutability creates all kinds of issues that won't be fixed until embedded_sdmmc > 0.8    
 
     // set up the song trigger pins
-    let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
+    //let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
+    let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.d9.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
+
     for pin in song_trigger_pins.as_mut() { pin.into_pull_up_input(); }
+
+    let mut amp_sd_pin = pins.sda.into_push_pull_output(); // low to disable the amp, high to enable in left-only mode (other settings not available when wired this way, but it doesn't really matter since we're outputting mono already)
+    amp_sd_pin.set_low().expect("couldnt set amp sd pin");
+
+    let _amp_gain_pin = pins.a0.into_alternate::<hal::gpio::B>();  //DAC pin
+    // start the dac clock
+    pm.apbcmask.modify(|_, w| {w.dac_().set_bit()});
+    clocks.dac(&gclk0).unwrap();
+    set_amp_gain(&mut peripherals.DAC, AMPGAIN::DB6);
     
 
     //----------START I2S STARTUP-----------
@@ -327,7 +338,12 @@ fn main() -> ! {
                             },
                                 _ => { panic!("Only 22.05/24/44.1/48 kHz sample rates are currently supported!"); }
                             }
+                            amp_sd_pin.set_high().expect("couldnt set amp sd pin");
+                            stolendelay.delay_us(7500u32); // datasheet says max 7.5 ms to turn on implifier
+
                             let completed = play_song(&mut songfile, &song_trigger_pins[i], &mut stolendelay);
+                            amp_sd_pin.set_low().expect("couldnt set amp sd pin");
+
                             status_led.set_low().expect("led setting failed!");
                             songfile.close().expect("Failed to close song file");
                             uart.write_fmt(format_args!("Song for trigger {} ended as completed={}, pausing to rest\r\n", i, completed)).expect("Could not write to uart!!");
@@ -386,7 +402,7 @@ fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1
     });
 
     // now prep and start up the I2S peripheral
-
+    
     start_i2s(data0 as u16 as u32);
 
     let mut completed = false;
@@ -519,6 +535,43 @@ fn validate_wav_file<D:BlockDevice,T:TimeSource>(file: &mut embedded_sdmmc::File
     if bitspersample != 16 { return Err(WavError::IncorrectWavFormatError(3)); }
 
     Ok(freq)
+}
+
+#[allow(dead_code)]
+enum AMPGAIN {
+    DB3,
+    DB6,
+    DB9,
+    DB12,
+    DB15
+}
+
+fn set_amp_gain(dac: &mut pac::DAC, gain: AMPGAIN) {
+    let dac_val = match gain {
+        AMPGAIN::DB3 => 0x3ff*3/4,
+        AMPGAIN::DB6 => 0x3ff,
+        AMPGAIN::DB9 => 0x3ff/2,
+        AMPGAIN::DB12 => 0x3ff*0,
+        AMPGAIN::DB15 => 0x3ff*1/4,
+    };
+
+    // do a reset, wait for sync/reset to complete
+    dac.ctrla.write(|w| w.swrst().set_bit());
+    while dac.status.read().syncbusy().bit_is_set() {}
+    while dac.ctrla.read().swrst().bit_is_set() {}
+
+    dac.ctrlb.write(|w| {
+        w.refsel().avcc()
+         .eoen().set_bit()
+    });
+
+    dac.data.write(|w| unsafe { w.data().bits(dac_val) });
+
+    //sync
+    while dac.status.read().syncbusy().bit_is_set() {}
+    //enable and sync
+    dac.ctrla.write(|w| w.enable().set_bit());
+    while dac.status.read().syncbusy().bit_is_set() {}
 }
 
 #[derive(Debug, Clone)]
