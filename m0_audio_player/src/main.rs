@@ -27,7 +27,7 @@ const SD_CARD_KHZ: u32 = 6000;
 const VOL_IDX: usize = 0;
 const N_SONGS: usize = 6;
 
-const BUFFER_CAPACITY: usize = 2048;
+const BUFFER_CAPACITY: usize = 4096;
 static DATA_BUFFER: Mutex<RefCell<Option<ArrayDeque<i16, BUFFER_CAPACITY>>>> = Mutex::new(RefCell::new(None));
 static I2S_PERIPHERAL: Mutex<RefCell<Option<pac::I2S>>> = Mutex::new(RefCell::new(None));
 
@@ -75,15 +75,15 @@ fn main() -> ! {
         uart.write_all("last start yielded the following panic:\n\r".as_bytes()).expect("Could not write panic to uart!!");
         uart.write_all(msg).expect("Could not write panic to uart!!");
         uart.write_all("\n\r".as_bytes()).expect("Could not write panic to uart!!");
+        uart.write_all("delaying for 4.5 sec then continuing\n\r".as_bytes()).expect("Could not write panic to uart!!");
 
         
         // slow blink forever, means a reset is needed
-        loop {
+        for _ in 0..3 {
             status_led.set_high().unwrap();
             delay.delay_ms(750u32);
             status_led.set_low().unwrap();
             delay.delay_ms(750u32);
-
         }
     }
 
@@ -330,7 +330,8 @@ fn main() -> ! {
                             let completed = play_song(&mut songfile, &song_trigger_pins[i], &mut stolendelay);
                             status_led.set_low().expect("led setting failed!");
                             songfile.close().expect("Failed to close song file");
-                            uart.write_fmt(format_args!("Song for trigger {} ended as completed={}\r\n", i, completed)).expect("Could not write to uart!!");
+                            uart.write_fmt(format_args!("Song for trigger {} ended as completed={}, pausing to rest\r\n", i, completed)).expect("Could not write to uart!!");
+                            stolendelay.delay_ms(250u8);
                         },
                         None => {
                             uart.write_fmt(format_args!("No song found for trigger {}\r\n", i)).expect("Could not write to uart!!");
