@@ -27,7 +27,7 @@ const SD_CARD_KHZ: u32 = 6000;
 const VOL_IDX: usize = 0;
 const N_SONGS: usize = 6;
 
-const DEFAULTGAIN: AMPGAIN = AMPGAIN::DB6;
+const DEFAULTGAIN: AMPGAIN = AMPGAIN::DB9;
 
 const BUFFER_CAPACITY: usize = 4096;
 
@@ -355,16 +355,18 @@ fn main() -> ! {
                 stolendelay.delay_ms(5u8);
                 if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
                     let (nextgain, nblinks) = match current_amp_gain {
-                        AMPGAIN::DB3 => (AMPGAIN::DB6, 3),
-                        AMPGAIN::DB6 => (AMPGAIN::DB9, 4),
-                        AMPGAIN::DB9 => (AMPGAIN::DB12, 5),
-                        AMPGAIN::DB12 => (AMPGAIN::DB15, 6),
-                        AMPGAIN::DB15 => (AMPGAIN::DB3, 2)
+                        AMPGAIN::DB3 => (AMPGAIN::DB6, 2),
+                        AMPGAIN::DB6 => (AMPGAIN::DB9, 3),
+                        AMPGAIN::DB9 => (AMPGAIN::DB12, 4),
+                        AMPGAIN::DB12 => (AMPGAIN::DB15, 5),
+                        AMPGAIN::DB15 => (AMPGAIN::DB3, 1)
                     };
                     set_amp_gain(&mut peripherals.DAC, nextgain.clone());
                     current_amp_gain = nextgain;
+                    wdt.disable();
+                    blink_led(&mut status_led, &mut stolendelay, nblinks, 150);
                     wdt.feed();
-                    blink_led(&mut status_led, &mut stolendelay, nblinks, 20);
+                    wdt.start(hal::watchdog::WatchdogTimeout::Cycles16K as u8);
                     amp_gain_button_cleared = false;
                 }
             }
