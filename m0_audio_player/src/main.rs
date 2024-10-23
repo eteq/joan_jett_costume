@@ -275,6 +275,7 @@ fn main() -> ! {
 
     wdt.start(hal::watchdog::WatchdogTimeout::Cycles16K as u8); // 16k cycles is ~ 500 ms
 
+    let mut amp_gain_button_cleared = true;
     let stolen_gclk = unsafe { Peripherals::steal() }.GCLK;
     loop {
         wdt.feed();
@@ -348,23 +349,32 @@ fn main() -> ! {
                 }
             }
         }
-        if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
+        if amp_gain_button_cleared {
+            if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
+                // do a debounce check
+                stolendelay.delay_ms(5u8);
+                if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
+                    let (nextgain, nblinks) = match current_amp_gain {
+                        AMPGAIN::DB3 => (AMPGAIN::DB6, 3),
+                        AMPGAIN::DB6 => (AMPGAIN::DB9, 4),
+                        AMPGAIN::DB9 => (AMPGAIN::DB12, 5),
+                        AMPGAIN::DB12 => (AMPGAIN::DB15, 6),
+                        AMPGAIN::DB15 => (AMPGAIN::DB3, 2)
+                    };
+                    set_amp_gain(&mut peripherals.DAC, nextgain.clone());
+                    current_amp_gain = nextgain;
+                    wdt.feed();
+                    blink_led(&mut status_led, &mut stolendelay, nblinks, 20);
+                    amp_gain_button_cleared = false;
+                }
+            }
+        } else if amp_gain_button_pin.is_high().expect("Failed to read gain pin")  {
             // do a debounce check
             stolendelay.delay_ms(5u8);
-            if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
-                let (nextgain, nblinks) = match current_amp_gain {
-                    AMPGAIN::DB3 => (AMPGAIN::DB6, 3),
-                    AMPGAIN::DB6 => (AMPGAIN::DB9, 4),
-                    AMPGAIN::DB9 => (AMPGAIN::DB12, 5),
-                    AMPGAIN::DB12 => (AMPGAIN::DB15, 6),
-                    AMPGAIN::DB15 => (AMPGAIN::DB3, 2)
-                };
-                set_amp_gain(&mut peripherals.DAC, nextgain.clone());
-                current_amp_gain = nextgain;
-                wdt.feed();
-                blink_led(&mut status_led, &mut stolendelay, nblinks, 20);
+            if amp_gain_button_pin.is_high().expect("Failed to read gain pin") {
+                amp_gain_button_cleared = true;
             }
-            
+
         }
     stolendelay.delay_ms(5u8);  // to kep the CPU mostly idleish when not playing music
     }
