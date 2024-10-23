@@ -27,7 +27,10 @@ const SD_CARD_KHZ: u32 = 6000;
 const VOL_IDX: usize = 0;
 const N_SONGS: usize = 6;
 
+const DEFAULTGAIN: AMPGAIN = AMPGAIN::DB6;
+
 const BUFFER_CAPACITY: usize = 4096;
+
 static DATA_BUFFER: Mutex<RefCell<Option<ArrayDeque<i16, BUFFER_CAPACITY>>>> = Mutex::new(RefCell::new(None));
 static I2S_PERIPHERAL: Mutex<RefCell<Option<pac::I2S>>> = Mutex::new(RefCell::new(None));
 
@@ -43,6 +46,7 @@ fn main() -> ! {
         &mut peripherals.NVMCTRL,
     );
     let gclk0 = clocks.gclk0();
+    //let gclk1 = clocks.gclk1();
     let mut pm = peripherals.PM;
     let pins = bsp::Pins::new(peripherals.PORT);
 
@@ -51,16 +55,6 @@ fn main() -> ! {
     status_led.set_low().unwrap(); // in case it was stuck on for some reason
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
-    // Setup UART peripheral and pins
-    // this uses the labeled pins... but we can't do that because it conflicts with I2S pins.  So use an alternative pin pair
-    // let mut uart = bsp::uart(
-    //     &mut clocks,
-    //     9600.Hz(),
-    //     periph_alias!(peripherals.uart_sercom),
-    //     &mut pm,
-    //     pin_alias!(pins.uart_rx),
-    //     pin_alias!(pins.uart_tx),
-    // );
     let uart_clock = clocks.sercom1_core(&gclk0).unwrap();
     let uart_sercom = peripherals.SERCOM1;
     let uart_pads = uart::Pads::default()
@@ -86,6 +80,11 @@ fn main() -> ! {
             delay.delay_ms(750u32);
         }
     }
+
+    // prep the WDT, but don't enable it until end end of setup
+    //clocks.wdt(&gclk1);  // this improves the accuracy of the WDT but it seems to be unneeded
+    let mut wdt = hal::watchdog::Watchdog::new(peripherals.WDT);
+    wdt.disable();
 
 
     // setup SD card in SPI mode
@@ -160,7 +159,6 @@ fn main() -> ! {
     // note: it would be better if we could actually open the files above but mutability creates all kinds of issues that won't be fixed until embedded_sdmmc > 0.8    
 
     // set up the song trigger pins
-    //let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.a0.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
     let mut song_trigger_pins: [hal::gpio::DynPin ; N_SONGS] = [pins.d9.into(), pins.a1.into(), pins.a2.into(), pins.a3.into(), pins.a4.into(), pins.a5.into()];
 
     for pin in song_trigger_pins.as_mut() { pin.into_pull_up_input(); }
@@ -168,12 +166,14 @@ fn main() -> ! {
     let mut amp_sd_pin = pins.sda.into_push_pull_output(); // low to disable the amp, high to enable in left-only mode (other settings not available when wired this way, but it doesn't really matter since we're outputting mono already)
     amp_sd_pin.set_low().expect("couldnt set amp sd pin");
 
+    // start the dac clock and then set it up
     let _amp_gain_pin = pins.a0.into_alternate::<hal::gpio::B>();  //DAC pin
-    // start the dac clock
     pm.apbcmask.modify(|_, w| {w.dac_().set_bit()});
     clocks.dac(&gclk0).unwrap();
-    set_amp_gain(&mut peripherals.DAC, AMPGAIN::DB6);
+    setup_amp_gain_dac(&mut peripherals.DAC, DEFAULTGAIN);
+    let mut current_amp_gain = DEFAULTGAIN;
     
+    let amp_gain_button_pin = pins.d5.into_pull_up_input();
 
     //----------START I2S STARTUP-----------
     let _i2s_fs = pins.d0.into_alternate::<hal::gpio::G>();
@@ -198,7 +198,7 @@ fn main() -> ! {
     // configure a clock generator for the needed frequencies and connect the slower one to the i2s clocks
     let i2s_gclk = clocks.configure_gclk_divider_and_source(
                 hal::clock::ClockGenId::GCLK3,
-                clock_div_base441, 
+                clock_div_base48, 
                 hal::clock::ClockSource::DFLL48M, 
                 true).expect("the gclk for i2s is already configured!");
 
@@ -225,15 +225,6 @@ fn main() -> ! {
             }
         });
     }
-    // peripherals.I2S.clkctrl[0].write(|w| {
-    //     unsafe {
-    //         w.slotsize()._16()
-    //             .fswidth().half()
-    //             .fsoutinv().set_bit()
-    //             .nbslots().bits(1)
-    //             .bitdelay().set_bit() 
-    //     }
-    // });
     // and the serializer
     peripherals.I2S.serctrl[0].write(|w| {
         w.mono().set_bit()
@@ -275,19 +266,18 @@ fn main() -> ! {
     // this is probably safe since it's set up exactly the same way as above as long as we don't try to do multithreading. But it's still a bit sketchy.
     let mut stolendelay = Delay::new(unsafe { CorePeripherals::steal() }.SYST, &mut clocks);
 
-    // let rtc_clock = clocks.rtc(&gclk0).unwrap();
-    // let rtc = hal::rtc::Rtc::count32_mode(peripherals.RTC, rtc_clock.freq(), &mut pm);
-    // rtc.count32();
-    
 
     // Completed setup! entering mainloop
-    uart.write_all("started!\n\r".as_bytes()).expect("Could not write start to uart!!");
+    uart.write_all("starting main loop!\n\r".as_bytes()).expect("Could not write start to uart!!");
 
     blink_led(&mut status_led, &mut stolendelay, 5, 100);
     status_led.set_low().expect("led setting failed!");
 
+    wdt.start(hal::watchdog::WatchdogTimeout::Cycles16K as u8); // 16k cycles is ~ 500 ms
+
     let stolen_gclk = unsafe { Peripherals::steal() }.GCLK;
     loop {
+        wdt.feed();
         for i in 0..song_trigger_pins.len() {
             if song_trigger_pins[i].is_low().expect("Failed to read song trigger pin") {
                 // do a debounce check
@@ -341,13 +331,15 @@ fn main() -> ! {
                             amp_sd_pin.set_high().expect("couldnt set amp sd pin");
                             stolendelay.delay_us(7500u32); // datasheet says max 7.5 ms to turn on implifier
 
-                            let completed = play_song(&mut songfile, &song_trigger_pins[i], &mut stolendelay);
+                            let completed = play_song(&mut songfile, &song_trigger_pins[i], &mut wdt, &mut stolendelay);
                             amp_sd_pin.set_low().expect("couldnt set amp sd pin");
 
                             status_led.set_low().expect("led setting failed!");
                             songfile.close().expect("Failed to close song file");
                             uart.write_fmt(format_args!("Song for trigger {} ended as completed={}, pausing to rest\r\n", i, completed)).expect("Could not write to uart!!");
+                            wdt.feed();
                             stolendelay.delay_ms(250u8);
+                            wdt.feed();
                         },
                         None => {
                             uart.write_fmt(format_args!("No song found for trigger {}\r\n", i)).expect("Could not write to uart!!");
@@ -355,6 +347,24 @@ fn main() -> ! {
                     }
                 }
             }
+        }
+        if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
+            // do a debounce check
+            stolendelay.delay_ms(5u8);
+            if amp_gain_button_pin.is_low().expect("Failed to read gain pin") {
+                let (nextgain, nblinks) = match current_amp_gain {
+                    AMPGAIN::DB3 => (AMPGAIN::DB6, 3),
+                    AMPGAIN::DB6 => (AMPGAIN::DB9, 4),
+                    AMPGAIN::DB9 => (AMPGAIN::DB12, 5),
+                    AMPGAIN::DB12 => (AMPGAIN::DB15, 6),
+                    AMPGAIN::DB15 => (AMPGAIN::DB3, 2)
+                };
+                set_amp_gain(&mut peripherals.DAC, nextgain.clone());
+                current_amp_gain = nextgain;
+                wdt.feed();
+                blink_led(&mut status_led, &mut stolendelay, nblinks, 20);
+            }
+            
         }
     stolendelay.delay_ms(5u8);  // to kep the CPU mostly idleish when not playing music
     }
@@ -375,6 +385,7 @@ fn blink_led<T: hal::gpio::PinId>(led: &mut hal::gpio::Pin<T, Output<PushPull>>,
 
 fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1>,
                                          trigger_pin: &hal::gpio::DynPin, 
+                                         wdt: &mut hal::watchdog::Watchdog,
                                          delay: &mut Delay) -> bool{
     // not the file should already be validated and at the start of the data section
 
@@ -386,6 +397,7 @@ fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1
     let data0 = i16::from_le_bytes(*samplebuf);
     
     // Then fill the buffer
+    wdt.feed();
     cortex_m::interrupt::free(|cs| {
         let mut data_buffer = DATA_BUFFER.borrow(cs).borrow_mut();
         let data_buffer = data_buffer.as_mut().expect("Data buffer not initialized");
@@ -412,7 +424,7 @@ fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1
     let mut nreadm1 = None;
     let read_buffer = &mut [0u8; 2*BUFFER_CAPACITY];
     loop {
-        
+        //PROBLEM        
         match nreadm1 {
             None => {
                 if file.is_eof() {
@@ -424,6 +436,7 @@ fn play_song<D:BlockDevice,T:TimeSource>(file: &mut File<D,T,N_SONGS, N_SONGS, 1
                 // read into the buffer.  This is by far the slowest operation so it's where the main data buffer is most likely to get drained
                 nreadm1 = Some(file.read(read_buffer).expect("Failed to read from file") - 1);
                 buffer_idx = 0;
+                wdt.feed(); // feed the watchdog after the read since this will still do it as oftenm as the data buffer is filled
             },
             Some(nreadm1val) => {
                 if buffer_idx >= nreadm1val { // this is why we need the -1 above - catches the unlikely but possible case of an odd number of bytes read
@@ -537,6 +550,7 @@ fn validate_wav_file<D:BlockDevice,T:TimeSource>(file: &mut embedded_sdmmc::File
     Ok(freq)
 }
 
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum AMPGAIN {
     DB3,
@@ -555,6 +569,15 @@ fn set_amp_gain(dac: &mut pac::DAC, gain: AMPGAIN) {
         AMPGAIN::DB15 => 0x3ff*1/4,
     };
 
+    dac.data.write(|w| unsafe { w.data().bits(dac_val) });
+
+    //sync
+    while dac.status.read().syncbusy().bit_is_set() {}
+}
+
+fn setup_amp_gain_dac(dac: &mut pac::DAC, gain: AMPGAIN) {
+    
+
     // do a reset, wait for sync/reset to complete
     dac.ctrla.write(|w| w.swrst().set_bit());
     while dac.status.read().syncbusy().bit_is_set() {}
@@ -565,10 +588,8 @@ fn set_amp_gain(dac: &mut pac::DAC, gain: AMPGAIN) {
          .eoen().set_bit()
     });
 
-    dac.data.write(|w| unsafe { w.data().bits(dac_val) });
+    set_amp_gain(dac, gain);
 
-    //sync
-    while dac.status.read().syncbusy().bit_is_set() {}
     //enable and sync
     dac.ctrla.write(|w| w.enable().set_bit());
     while dac.status.read().syncbusy().bit_is_set() {}
